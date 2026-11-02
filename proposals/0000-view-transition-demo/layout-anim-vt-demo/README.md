@@ -16,6 +16,14 @@ It includes `react-native-reanimated`, like the default Expo template.
 3. **Patching npm packages reproducibly** — `patch-package` auto-applies on every
    `npm install` via the `postinstall` hook.
 4. **Four layout-animation examples on the Home screen**: 1 · React ViewTransition; 2–4 · Reanimated
+5. **Shared tab** — shared element transition: a list card moves into the detail
+   header (`onShare`), the other cards exit away from it (`onExit` on the old
+   pseudo element). Back reverses it.
+6. **Routes tab** — route cross-fade with `<Activity>`: hiding a route is an exit,
+   revealing one is an enter. A switch turns the animation off for comparison.
+
+Animations are driven from the ViewTransition event handlers by
+`src/lib/ViewTransitionAnimationHelper.js` (experimental, not a proposed public API).
 
 ## Prerequisites
 
