@@ -1,14 +1,21 @@
 /**
- * Adapted from React Native's ViewTransition animation helper — it FLIPs the "new" view from the old
- * rect to the new rect by building a native Animated graph.
+ * Adapted from React Native's ViewTransition animation helper. It drives
+ * ViewTransition animations by building a native Animated graph:
+ *   - animateShare: FLIPs the "new" view from the old rect to the new rect.
+ *   - animate: plays keyframes on an "old" or "new" pseudo element (enter/exit).
  */
 
+import { LogBox, processColor } from 'react-native';
 import { getFabricUIManager } from 'react-native/Libraries/ReactNative/FabricUIManager';
 import NativeAnimatedHelper from 'react-native/src/private/animated/NativeAnimatedHelper';
 import * as ReactNativeFeatureFlags from 'react-native/src/private/featureflags/ReactNativeFeatureFlags';
 import NativeViewTransition from 'react-native/src/private/viewtransition/specs/NativeViewTransition';
 
 const { API, generateNewAnimationId, generateNewNodeTag } = NativeAnimatedHelper;
+
+// The private APIs above are only reachable through deep imports; keep their
+// deprecation warning from covering the demo UI.
+LogBox.ignoreLogs(["Deep imports from the 'react-native' package are deprecated"]);
 
 function getViewTransitionInstance(element) {
   return (
@@ -19,11 +26,39 @@ function getViewTransitionInstance(element) {
   );
 }
 
-// Build a native Animated graph that tweens the given numeric style props of
-// `nativeInstance` from their `from` values to their `to` values over `duration` ms.
-function animateLayout(nativeInstance, from, to, duration) {
-  const props = Object.keys(to);
-  if (props.length === 0) {
+// Normalize {from, to} / {'0%': ..., '100%': ...} keyframes into sorted stops.
+function normalizeKeyframes(keyframes) {
+  const stops = [];
+  for (const key of Object.keys(keyframes)) {
+    const offset =
+      key === 'from' ? 0 : key === 'to' ? 1 : key.endsWith('%') ? parseFloat(key) / 100 : null;
+    if (offset != null) {
+      stops.push({ offset, properties: keyframes[key] });
+    }
+  }
+  return stops.sort((a, b) => a.offset - b.offset);
+}
+
+function createInterpolation(driverTag, inputRange, outputRange, outputType, createdNodeTags) {
+  const interpTag = generateNewNodeTag();
+  API.createAnimatedNode(interpTag, {
+    type: 'interpolation',
+    inputRange,
+    outputRange,
+    outputType,
+    extrapolateLeft: 'extend',
+    extrapolateRight: 'extend',
+  });
+  API.connectAnimatedNodes(driverTag, interpTag);
+  createdNodeTags.push(interpTag);
+  return interpTag;
+}
+
+// Build a native Animated graph that plays `keyframes` (numeric/color style
+// props and RN transform arrays) on `nativeInstance` over `duration` ms.
+function animateKeyframes(nativeInstance, keyframes, duration, pseudo, restoreOnComplete) {
+  const stops = normalizeKeyframes(keyframes);
+  if (stops.length === 0) {
     return;
   }
 
@@ -34,20 +69,47 @@ function animateLayout(nativeInstance, from, to, duration) {
   const createdNodeTags = [driverTag];
   const styleConfig = {};
 
-  // One interpolation node per prop, driven by the value node.
+  const props = new Set(stops.flatMap((stop) => Object.keys(stop.properties)));
   for (const prop of props) {
-    const interpTag = generateNewNodeTag();
-    API.createAnimatedNode(interpTag, {
-      type: 'interpolation',
-      inputRange: [0, 1],
-      outputRange: [from[prop], to[prop]],
-      outputType: 'number',
-      extrapolateLeft: 'extend',
-      extrapolateRight: 'extend',
-    });
-    API.connectAnimatedNodes(driverTag, interpTag);
-    createdNodeTags.push(interpTag);
-    styleConfig[prop] = interpTag;
+    if (prop === 'transform') {
+      // One interpolation per transform entry, matched by position across stops.
+      const transformStops = stops.filter((stop) => Array.isArray(stop.properties.transform));
+      const entries = transformStops[0].properties.transform.flatMap((t) => Object.keys(t));
+      const transforms = entries.map((property, i) => {
+        const valueAt = (stop) =>
+          stop.properties.transform.flatMap((t) => Object.values(t))[i] ?? 0;
+        return {
+          type: 'animated',
+          property,
+          nodeTag: createInterpolation(
+            driverTag,
+            transformStops.map((stop) => stop.offset),
+            transformStops.map(valueAt),
+            'number',
+            createdNodeTags
+          ),
+        };
+      });
+      const transformTag = generateNewNodeTag();
+      API.createAnimatedNode(transformTag, { type: 'transform', transforms });
+      for (const t of transforms) {
+        API.connectAnimatedNodes(t.nodeTag, transformTag);
+      }
+      createdNodeTags.push(transformTag);
+      styleConfig.transform = transformTag;
+    } else {
+      const propStops = stops.filter((stop) => stop.properties[prop] != null);
+      const isColor = typeof propStops[0].properties[prop] === 'string';
+      styleConfig[prop] = createInterpolation(
+        driverTag,
+        propStops.map((stop) => stop.offset),
+        propStops.map((stop) =>
+          isColor ? processColor(stop.properties[prop]) : stop.properties[prop]
+        ),
+        isColor ? 'color' : 'number',
+        createdNodeTags
+      );
+    }
   }
 
   // Style node -> props node -> view.
@@ -66,14 +128,19 @@ function animateLayout(nativeInstance, from, to, duration) {
   API.connectAnimatedNodeToView(propsTag, nativeInstance.nativeTag);
 
   if (ReactNativeFeatureFlags.useSharedAnimatedBackend()) {
-    const shadowNode = getFabricUIManager()?.findShadowNodeByTag_DEPRECATED?.(
-      nativeInstance.nativeTag
-    );
+    // The "old" pseudo element is a Fabric-only shadow node (no React fiber),
+    // so it can't be found through the regular UIManager lookup.
+    const shadowNode =
+      pseudo === 'old'
+        ? NativeViewTransition?.findPseudoElementShadowNodeByTag?.(nativeInstance.nativeTag)
+        : getFabricUIManager()?.findShadowNodeByTag_DEPRECATED?.(nativeInstance.nativeTag);
     if (shadowNode != null) {
       API.connectAnimatedNodeToShadowNodeFamily(propsTag, shadowNode);
     } else {
       console.error(
-        'ShadowNode is not available for pseudo element at tag',
+        'ShadowNode is not available for',
+        pseudo,
+        'pseudo element at tag',
         nativeInstance.nativeTag
       );
     }
@@ -87,6 +154,7 @@ function animateLayout(nativeInstance, from, to, duration) {
   }
 
   const animationId = generateNewAnimationId();
+  // Keep the view transition open until this animation finishes.
   NativeViewTransition?.waitForTransitionAnimation?.(animationId);
 
   API.setAnimatedNodeValue(driverTag, 0);
@@ -97,12 +165,37 @@ function animateLayout(nativeInstance, from, to, duration) {
     () => {
       API.stopAnimation(animationId);
       NativeViewTransition?.transitionAnimationFinished?.(animationId);
-      API.restoreDefaultValues(propsTag);
+      if (restoreOnComplete) {
+        API.restoreDefaultValues(propsTag);
+      }
+      // Disconnect before dropping: the props node must still exist to disconnect.
+      API.disconnectAnimatedNodeFromView(propsTag, nativeInstance.nativeTag);
       for (let i = createdNodeTags.length - 1; i >= 0; i--) {
         API.dropAnimatedNode(createdNodeTags[i]);
       }
-      API.disconnectAnimatedNodeFromView(propsTag, nativeInstance.nativeTag);
     }
+  );
+}
+
+/**
+ * Play keyframes on a pseudo element, e.g. `instance.new` in onEnter or
+ * `instance.old` in onExit:
+ *   animate(instance.old, {
+ *     animationDuration: 300,
+ *     animation: {keyframes: {from: {opacity: 1}, to: {opacity: 0}}},
+ *   });
+ */
+export function animate(pseudoElement, options) {
+  const keyframes = options?.animation?.keyframes;
+  if (keyframes == null) {
+    return;
+  }
+  animateKeyframes(
+    getViewTransitionInstance(pseudoElement),
+    keyframes,
+    options?.animationDuration ?? 300,
+    pseudoElement._pseudo,
+    false
   );
 }
 
@@ -138,17 +231,19 @@ export function animateShare(instance, options) {
     return;
   }
 
-  const duration = options?.animationDuration ?? 300;
-
-  animateLayout(
+  animateKeyframes(
     newInstance,
     {
-      left: oldInstance.x - newInstance.x,
-      top: oldInstance.y - newInstance.y,
-      width: oldInstance.width,
-      height: oldInstance.height,
+      from: {
+        left: oldInstance.x - newInstance.x,
+        top: oldInstance.y - newInstance.y,
+        width: oldInstance.width,
+        height: oldInstance.height,
+      },
+      to: { left: 0, top: 0, width: newInstance.width, height: newInstance.height },
     },
-    { left: 0, top: 0, width: newInstance.width, height: newInstance.height },
-    duration
+    options?.animationDuration ?? 300,
+    'new',
+    true
   );
 }
